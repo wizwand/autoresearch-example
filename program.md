@@ -1,114 +1,209 @@
-# autoresearch
+# Autonomous Training Optimization Program
 
-This is an experiment to have the LLM do its own research.
+This document defines how an autonomous coding agent should iteratively improve the training pipeline in this repository.
 
-## Setup
+## Goal
 
-To set up a new experiment, work with the user to:
+Improve the training setup to achieve the best possible validation outcome under the repository's existing constraints.
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+Primary metric to optimize:
+- `val_bpb`: `lower` is better
 
-Once you get confirmation, kick off the experimentation.
+Secondary metrics / constraints:
+- `training_seconds`: should stay close to the fixed budget (`300s` measured training time)
+- `peak_vram_mb`: should stay within available single-GPU memory (no OOM)
+- `mfu_percent`: higher is better when `val_bpb` is not regressing
+- run must complete successfully and print the final summary block
 
-## Experimentation
+Per-run budget:
+- wall clock budget: fixed `TIME_BUDGET = 300` seconds of measured training time from `prepare.py`
+- note: `train.py` excludes startup/compile overhead by only counting steady-state steps after step 10
+- timeout rule for automation: if total wall-clock runtime exceeds `900s`, terminate and mark `timeout`
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Success criteria:
+- improve `val_bpb` versus baseline/best-known commit
+- do not crash (`FAIL`, exception, OOM, NaN/Inf behavior)
+- keep evaluation protocol unchanged (`evaluate_bpb` path)
+- prefer simpler, attributable changes when performance is similar
 
-**What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+## Repository scope
 
-**What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+Read these files first for context:
+- `README.md`
+- `train.py`
+- `prepare.py`
+- `pyproject.toml`
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+Primary training entrypoint:
+- `uv run train.py`
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+Primary evaluation path:
+- final metric comes from `prepare.evaluate_bpb(...)`, called at end of `train.py`
+- summary is printed after a `---` separator and includes `val_bpb`, runtime, memory, and model stats
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+Artifacts and logs to inspect:
+- stdout/stderr from training run (`run.log`)
+- final printed summary block in `run.log`
+- optional local cache artifacts in `~/.cache/autoresearch/` (data/tokenizer), but these are not experiment outputs
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+## What can be modified
+
+The agent may modify:
+- `train.py` only
+- model architecture knobs in `train.py` (e.g. `DEPTH`, `ASPECT_RATIO`, `HEAD_DIM`, `WINDOW_PATTERN`)
+- optimization and schedule knobs in `train.py` (LRs, betas, warmup/warmdown, weight decay, batch sizing)
+- training-loop internals in `train.py` that do not alter evaluation integrity
+
+## What cannot be modified
+
+The agent must NOT:
+- modify validation metric definition (`evaluate_bpb`) or how it is computed
+- modify dataset contents, shard pinning, tokenizer training logic, or byte accounting in `prepare.py`
+- modify held-out validation shard behavior (`VAL_SHARD`/`VAL_FILENAME` path)
+- add new dependencies or external services
+- bypass final evaluation or hardcode reported metrics
+- rewrite unrelated project files/infrastructure
+
+Do NOT modify:
+- `prepare.py`
+- `pyproject.toml`
+- dataset/cache contents under `~/.cache/autoresearch/`
+- official metric reporting format in the final summary block
+
+## Baseline run
+
+The first experiment must always be the baseline:
+1. run the pipeline exactly as-is from a clean commit:
+   - `uv run train.py > run.log 2>&1`
+2. confirm run completed and printed the final summary block
+3. extract `val_bpb` and runtime stats from the block
+4. record in `autoexp_results.tsv` as baseline (`status=keep` for initial reference)
+5. compare all subsequent experiments against this baseline/best-known result
 
 ## Output format
 
-Once the script finishes it prints a summary like this:
+At the end of each run, extract these fields from the final summary block in `run.log`:
 
-```
----
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+```text
+val_bpb:          <float>
+training_seconds: <float>
+total_seconds:    <float>
+peak_vram_mb:     <float>
+mfu_percent:      <float>
+total_tokens_M:   <float>
+num_steps:        <int>
+num_params_M:     <float>
+depth:            <int>
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
-
-```
-grep "^val_bpb:" run.log
-```
+The block is printed exactly after a line containing `---`.
+If a run exits early (e.g. prints `FAIL` and exits), mark missing fields as `NA`.
 
 ## Logging results
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+Log every experiment to:
+- `autoexp_results.tsv`
 
-The TSV has a header row and 5 columns:
+Use tab-separated format with this header:
 
+```text
+commit	primary_metric	status	description	runtime_sec	peak_vram_mb	notes
 ```
-commit	val_bpb	memory_gb	status	description
-```
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+Field mapping:
+- `commit`: short git commit hash of the experiment
+- `primary_metric`: value of `val_bpb`
+- `status`: `keep`, `discard`, `crash`, `timeout`, `oom`, or `nan`
+- `description`: one-line description of change tested
+- `runtime_sec`: `total_seconds` from summary (or `NA`)
+- `peak_vram_mb`: from summary (or `NA`)
+- `notes`: why kept/discarded or failure diagnosis
 
-Example:
+Do not commit `autoexp_results.tsv` unless explicitly requested.
 
-```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
-```
+## Search space hints
+
+High-priority knobs:
+- learning rates: `EMBEDDING_LR`, `UNEMBEDDING_LR`, `MATRIX_LR`, `SCALAR_LR`
+- optimization schedule: `WARMUP_RATIO`, `WARMDOWN_RATIO`, `FINAL_LR_FRAC`, `ADAM_BETAS`, `WEIGHT_DECAY`
+- throughput/memory tradeoff: `TOTAL_BATCH_SIZE`, `DEVICE_BATCH_SIZE` (with implied `grad_accum_steps`)
+- model capacity: `DEPTH`, `ASPECT_RATIO`, `HEAD_DIM`, `WINDOW_PATTERN`
+
+Low-priority or risky knobs:
+- major rewrites to attention/optimizer kernels
+- dataloader packing semantics
+- changing numerical behavior that risks instability without clear hypothesis
+
+Known repo-specific traps:
+- OOM from increasing `DEVICE_BATCH_SIZE`, `DEPTH`, or model width too aggressively
+- invalid batch math if `TOTAL_BATCH_SIZE % (DEVICE_BATCH_SIZE * MAX_SEQ_LEN) != 0` (assert crash)
+- instability fast-fail in `train.py`: run exits if `train_loss` is NaN or `> 100`
+- kernel/device compatibility issues around Flash Attention kernel loading on non-supported GPUs
+
+## Experimentation principles
+
+- Always make one coherent, attributable experiment per commit
+- Keep edits focused to `train.py`
+- Preserve reproducibility (`torch.manual_seed(42)` path should remain deterministic)
+- Prefer changes that improve `val_bpb` without inflating runtime/memory excessively
+- Revert non-improving or unstable experiments
+- Continue from best-known commit only
+
+Reasonable experiments:
+- LR/schedule tuning
+- batch size vs grad accumulation tradeoffs
+- depth/width/window-pattern tradeoffs under fixed 5-minute training budget
+- optimizer hyperparameter adjustments already supported in current code
+
+Unreasonable experiments:
+- modifying validation logic or data split definitions
+- skipping final eval
+- hardcoding metric outputs
+- broad speculative rewrites that confound attribution
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
-
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+1. Check current branch and identify best-known `val_bpb` from `autoexp_results.tsv`.
+2. Choose one promising `train.py` change.
+3. Edit only allowed file(s) (`train.py`).
+4. Commit with a short message describing the hypothesis.
+5. Run experiment:
+   - `uv run train.py > run.log 2>&1`
+6. Parse `run.log` summary block and extract metrics.
+7. On failure, inspect `tail -n 80 run.log` and classify (`crash`/`oom`/`nan`/`timeout`).
+8. Append one row to `autoexp_results.tsv`.
+9. If `val_bpb` improved meaningfully and run is stable, mark `keep` and continue from this commit.
+10. Otherwise mark `discard` (or failure status) and return to previous best commit.
+11. Repeat.
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+## Failure handling
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+Treat these as failures unless trivial to fix:
+- Python exception / import error / assertion failure
+- CUDA OOM
+- `FAIL` printed by training loop (NaN or exploding loss)
+- missing final summary block
+- timeout beyond `900s` wall clock
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+Crash handling policy:
+- small, obvious mistakes can be fixed and retried once
+- if idea appears fundamentally unstable or too costly, log and discard
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+## Branching and reproducibility
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+Recommended branch naming:
+- `autoexp/<date>-<tag>`
+
+For each run:
+- keep experiment changes committed before running
+- avoid mixing unrelated modifications
+- keep logs (`run.log`) and `autoexp_results.tsv` local unless asked to commit
+- preserve the best-known runnable state
+
+## Final instruction to the agent
+
+You are acting as an autonomous training researcher for this repo.
+Run disciplined, incremental experiments on `train.py` to reduce `val_bpb` under the fixed 5-minute training budget.
+Keep evaluation integrity intact, log every run to `autoexp_results.tsv`, and prefer robust improvements over risky rewrites.
